@@ -1,0 +1,14 @@
+vllm==v0.10.2
+lightning
+sentencepiece
+sacremoses
+transformers
+wandb>=0.12.10
+datasets 
+peft 
+bitsandbytes 
+accelerate 
+evaluate 
+sacrebleu
+matplotlib
+pandas
