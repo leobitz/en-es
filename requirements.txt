@@ -1,3 +1,6 @@
 sacremoses
 transformers
 pandas
+torch
+torchvision 
+torchaudio
