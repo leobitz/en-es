@@ -17,6 +17,13 @@ from transformers.trainer_callback import EarlyStoppingCallback
 
 from transformers import LlamaForCausalLM
 from peft import LoraConfig, get_peft_model
+from transformers import set_seed
+from huggingface_hub import HfApi, create_repo
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
+
+set_seed(42)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("WANDB_PROJECT", "en-es")
@@ -166,8 +173,10 @@ if not os.path.exists("exp-data/en-es-train-val.parquet"):
     train_proc_df.to_parquet("exp-data/en-es-train-val.parquet")
 else:
     train_proc_df = pd.read_parquet("exp-data/en-es-train-val.parquet")
-    train_df = train_proc_df[train_proc_df["split"] == "train"].reset_index(drop=True)
-    val_df = train_proc_df[train_proc_df["split"] == "val"].reset_index(drop=True)
+    train_df = train_proc_df[train_proc_df["split"] == "train"]
+    train_df = train_df.sample(min(max_train_sample_size, len(train_df)), random_state=42).reset_index(drop=True)
+    val_df = train_proc_df[train_proc_df["split"] == "val"]
+    val_df = val_df.sample(min(max_val_sample_size, len(val_df)), random_state=42).reset_index(drop=True)
     print(f"Number of samples: {len(train_df)}")
     print(f"Number of validation samples: {len(val_df)}")
 
@@ -280,5 +289,38 @@ trainer.add_callback(
 )
 
 trainer.train()
+best_model_path = trainer.state.best_model_checkpoint
+print("Best model saved at:", best_model_path)
 
+best_checkpoint = trainer.state.best_model_checkpoint
+if best_checkpoint is not None:
+    print(f"Loading best model from {best_checkpoint}")
+    trainer._load_best_model()
+else:
+    print("No best checkpoint found; evaluating current model weights.")
+eval_results = trainer.evaluate(eval_dataset=val_dataset)
+val_loss = eval_results.get("eval_loss")
+print(f"Validation loss: {val_loss}")
+
+    
+hf_repo_id = run_name
+hf_repo_id = f"leobitz/{hf_repo_id}"
+hf_token = os.environ.get("HF_TOKEN")
+
+artifact_dir = Path("exp-data/hf-artifacts") / Path(run_name).name
+artifact_dir.mkdir(parents=True, exist_ok=True)
+
+model.save_pretrained(artifact_dir)
+tokenizer.save_pretrained(artifact_dir)
+model.config.save_pretrained(artifact_dir)
+
+api = HfApi(token=hf_token)
+create_repo(repo_id=hf_repo_id, exist_ok=True, token=hf_token, private=True)
+api.upload_folder(
+    repo_id=hf_repo_id,
+    folder_path=str(artifact_dir),
+    path_in_repo=".",
+    commit_message=f"Upload {run_name} Performance {val_loss:.4f}",
+)
+print(f"Pushed model and tokenizer to https://huggingface.co/{hf_repo_id}")
 
