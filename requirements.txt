@@ -4,3 +4,4 @@ pandas
 torch
 torchvision 
 torchaudio
+wandb>=0.12.10

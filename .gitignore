@@ -2,3 +2,4 @@ exp-data/
 .ipynb_checkpoints/
 __pycache__/
 lightning_logs/
+wandb/
