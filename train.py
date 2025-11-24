@@ -1,4 +1,5 @@
 
+import argparse
 import pandas as pd
 from transformers import pipeline
 # Load model directly
@@ -23,22 +24,35 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train EN->ES translation model")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--num-frozen-layers", type=int, default=8, help="Count of frozen base layers")
+    parser.add_argument("--num-task-layers", type=int, default=2, help="Number of task-specific layers")
+    parser.add_argument("--use-lora", action="store_true", help="Enable LoRA fine-tuning")
+    parser.add_argument("--use-qlora", action="store_true", help="Enable QLoRA fine-tuning")
+    return parser.parse_args()
 
-num_frozen_layers = 8
-num_task_layers = 2
-max_length = 128
+# exmaple
+# python trian.py --epochs 5 --num-frozen-layers 10 --num-task-layers 4 --use-lora
+
+args = parse_args()
+
+num_frozen_layers = args.num_frozen_layers
+num_task_layers = args.num_task_layers
+max_length = 512
 effective_batch_size = 32
 batch_size = 32
 accumulate_grad_batches = effective_batch_size // batch_size
 weight_decay = 0.01
-epochs = 3
+epochs = args.epochs
 learning_rate = 5e-5
 grad_clip_val = 1.0
 max_train_sample_size = 100_000
 max_val_sample_size = 10_000
 model_name_or_path = "HuggingFaceTB/SmolLM-135M"
-use_lora = False
-use_qlora = False
+use_lora = args.use_lora
+use_qlora = args.use_qlora
 is_multi_task = (not use_lora)  and (not use_qlora)
 run_name = f"multi-task-{is_multi_task}-frozen-{num_frozen_layers}-task-layers-{num_task_layers}"
 print(run_name)
