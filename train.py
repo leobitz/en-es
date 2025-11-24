@@ -54,7 +54,8 @@ model_name_or_path = "HuggingFaceTB/SmolLM-135M"
 use_lora = args.use_lora
 use_qlora = args.use_qlora
 is_multi_task = (not use_lora)  and (not use_qlora)
-run_name = f"multi-task-{is_multi_task}-frozen-{num_frozen_layers}-task-layers-{num_task_layers}"
+method_name = "multi-task" if is_multi_task else "lora-qlora"
+run_name = f"{method_name}-frozen-{num_frozen_layers}-task-layers-{num_task_layers}"
 print(run_name)
 
 
@@ -252,7 +253,7 @@ checkpoint_callback = ModelCheckpoint(
     filename="best-{epoch:02d}-{val_loss:.4f}"
 )
 
-wandb_logger = WandbLogger(name="bitzbrain", project="en-es", log_model="all")
+wandb_logger = WandbLogger(name=run_name, project="en-es", log_model="all")
 
 lit_model = LitTranslationModel(model, tokenizer, lr=learning_rate)
 
