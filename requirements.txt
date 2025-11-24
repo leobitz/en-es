@@ -5,3 +5,12 @@ torch
 torchvision 
 torchaudio
 wandb>=0.12.10
+datasets 
+peft 
+bitsandbytes 
+accelerate 
+evaluate 
+sacrebleu
+matplotlib
+vllm
+pandas
