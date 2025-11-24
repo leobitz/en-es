@@ -1,4 +1,4 @@
-vllm
+vllm==v0.10.2
 lightning
 sentencepiece
 sacremoses
