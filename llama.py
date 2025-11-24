@@ -43,7 +43,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
-from transformers.models.llama.configuration_llama import LlamaConfig
+from llama_config import MyLlamaConfig
 
 
 logger = logging.get_logger(__name__)
@@ -73,7 +73,7 @@ class LlamaRMSNorm(nn.Module):
 class LlamaRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: LlamaConfig, device=None):
+    def __init__(self, config: MyLlamaConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
@@ -197,7 +197,7 @@ def eager_attention_forward(
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: MyLlamaConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -266,7 +266,7 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: MyLlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -313,7 +313,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class LlamaPreTrainedModel(PreTrainedModel):
-    config: LlamaConfig
+    config: MyLlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["LlamaDecoderLayer"]
@@ -332,7 +332,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
 @auto_docstring
 class LlamaModel(LlamaPreTrainedModel):
-    def __init__(self, config: LlamaConfig, num_layers=None):
+    def __init__(self, config: MyLlamaConfig, num_layers=None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
