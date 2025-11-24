@@ -1,9 +1,8 @@
+vllm
+lightning
+sentencepiece
 sacremoses
 transformers
-pandas
-torch
-torchvision 
-torchaudio
 wandb>=0.12.10
 datasets 
 peft 
@@ -12,5 +11,4 @@ accelerate
 evaluate 
 sacrebleu
 matplotlib
-vllm
 pandas
