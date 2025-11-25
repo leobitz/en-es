@@ -14,7 +14,6 @@ from transformers import (
     AutoConfig
 )
 from transformers.trainer_callback import EarlyStoppingCallback
-
 from transformers import LlamaForCausalLM
 from peft import LoraConfig, get_peft_model
 from transformers import set_seed
@@ -22,7 +21,7 @@ from huggingface_hub import HfApi, create_repo
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
-
+from transformers.trainer_callback import PrinterCallback
 set_seed(42)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -262,7 +261,7 @@ training_args = TrainingArguments(
     metric_for_best_model="eval_loss",
     greater_is_better=False,
     logging_dir=f"exp-data/runs/{run_name}/logs",
-    logging_steps=10,
+    logging_steps=1000,
     report_to=["wandb"],
     max_grad_norm=grad_clip_val,
     lr_scheduler_type="cosine",
@@ -270,6 +269,8 @@ training_args = TrainingArguments(
     dataloader_num_workers=dataloader_workers,
     fp16=torch.cuda.is_available(),
     optim="adamw_torch",
+    logging_strategy="steps",
+    disable_tqdm=False,  
 )
 
 trainer = Trainer(
@@ -287,6 +288,7 @@ trainer.add_callback(
         early_stopping_threshold=0.001,
     )
 )
+trainer.remove_callback(PrinterCallback)
 
 trainer.train()
 best_model_path = trainer.state.best_model_checkpoint
