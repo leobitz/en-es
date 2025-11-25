@@ -1,1 +1,1 @@
-# vllm serve HuggingFaceTB/SmolLM-135M --host 0.0.0.0  --port 8000  --max-model-len 2048 --gpu-memory-utilization 0.9
+vllm serve HuggingFaceTB/SmolLM-135M --host 0.0.0.0  --port 8000  --max-model-len 2048 --gpu-memory-utilization 0.9
