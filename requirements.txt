@@ -1,4 +1,5 @@
 vllm==v0.10.2
+pandas
 lightning
 sentencepiece
 sacremoses

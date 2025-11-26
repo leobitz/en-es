@@ -1,9 +1,9 @@
-python train_hf_augmented.py --epochs 15 --num-frozen-layers 18 --num-task-layers 0 --aug-size 0.2 --use-lora
+# python sft_train.py --num_frozen_layers 28 --num_task_layers 2 --aug_size 1.0 --epochs 10
+# python sft_train.py --num_frozen_layers 22 --num_task_layers 2 --aug_size 1.0 --epochs 10
+# python sft_train.py --num_frozen_layers 14 --num_task_layers 2 --aug_size 1.0 --epochs 10
+# python sft_train.py --num_frozen_layers 6 --num_task_layers 2 --aug_size 1.0 --epochs 10
 
-python train_hf_augmented.py --epochs 15 --num-frozen-layers 16 --num-task-layers 2 --aug-size 0.2
-
-python train_hf_augmented.py --epochs 15 --num-frozen-layers 18 --num-task-layers 0 --aug-size 1.0 --use-lora
-
-python train_hf_augmented.py --epochs 15 --num-frozen-layers 16 --num-task-layers 2 --aug-size 1.0
-
-
+python sft_train.py --num_frozen_layers 30 --num_task_layers 0 --aug_size 1.0 --epochs 10 --bf16 --lora
+python sft_train.py --num_frozen_layers 24 --num_task_layers 0 --aug_size 1.0 --epochs 10 --bf16 --lora
+python sft_train.py --num_frozen_layers 16 --num_task_layers 0 --aug_size 1.0 --epochs 10 --bf16 --lora
+python sft_train.py --num_frozen_layers 8 --num_task_layers 0 --aug_size 1.0 --epochs 10 --bf16 --lora

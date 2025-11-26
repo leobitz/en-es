@@ -2,7 +2,7 @@
 import argparse
 import os
 import copy
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import torch
 from transformers import (
@@ -10,12 +10,11 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     Trainer,
-    TrainingArguments,
-    AutoConfig
+    TrainingArguments
 )
 from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
-from transformers import LlamaForCausalLM
-# from llama import LlamaForCausalLM
+# from transformers import LlamaForCausalLM
+from llama import LlamaForCausalLM
 from peft import LoraConfig, get_peft_model
 from transformers import set_seed
 from huggingface_hub import HfApi, create_repo
@@ -27,6 +26,15 @@ set_seed(42)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("WANDB_PROJECT", "en-es")
+
+length_schedule: List[Tuple[int, int]] = [
+    (0, 64),
+    (3, 128),
+    (4, 256),
+    (5, 384),
+    (6, 480),
+    (7, 512),
+]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train EN->ES translation model")
@@ -47,7 +55,7 @@ num_frozen_layers = args.num_frozen_layers
 num_task_layers = args.num_task_layers
 
 max_length = 512
-effective_batch_size = 64
+effective_batch_size = 32
 batch_size = 32
 accumulate_grad_batches = effective_batch_size // batch_size
 weight_decay = 0.01
@@ -63,7 +71,7 @@ aug_size = args.aug_size
 
 is_multi_task = (not use_lora)  and (not use_qlora)
 method_name = "multi-task" if is_multi_task else "lora-qlora"
-run_name = f"{method_name}-frozen-{num_frozen_layers}-task-layers-{num_task_layers}-aug-{aug_size}"
+run_name = f"{method_name}-frozen-{num_frozen_layers}-task-layers-{num_task_layers}-aug-{aug_size}_curriculum"
 print(run_name)
 os.environ.setdefault("WANDB_NAME", run_name)
 
@@ -152,6 +160,19 @@ print(f"Non-trainable parameters: {non_trainable_params:,}")
 
 template = "English: {english_text} Spanish: {spanish_text} <|END|>"
 
+
+def ensure_length_column(df: pd.DataFrame, tokenizer: AutoTokenizer) -> pd.DataFrame:
+    if "length" in df.columns and df["length"].notna().all():
+        return df
+
+    def _compute_length(row: pd.Series) -> int:
+        sample_text = template.format(english_text=row["EN"], spanish_text=row["ES"])
+        return len(tokenizer.encode(sample_text, add_special_tokens=False))
+
+    df = df.copy()
+    df["length"] = df.apply(_compute_length, axis=1)
+    return df
+
 # exp-data/en-es-train-val.parquet
 if not os.path.exists("exp-data/en-es-train-val.parquet"):
     data_df = pd.read_parquet("exp-data/en-es.parquet")
@@ -197,38 +218,87 @@ else:
     print(f"Number of validation samples: {len(val_df)}")
 
 
+train_df = ensure_length_column(train_df, tokenizer)
+val_df = ensure_length_column(val_df, tokenizer)
+
+
 class TranslationDataset(torch.utils.data.Dataset):
-    def __init__(self, df, tokenizer, max_length=128):
-        self.df = df
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        tokenizer: AutoTokenizer,
+        max_length: int = 512,
+        initial_length_limit: Optional[int] = None,
+        enable_curriculum: bool = True,
+    ) -> None:
+        self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.absolute_max_length = max_length
+        self.enable_curriculum = enable_curriculum
         self.template = "English: {} Spanish: "
+        self.current_length_limit = min(initial_length_limit or max_length, max_length)
+        self.active_indices: List[int] = []
+        self._recompute_active_indices(force=True)
 
-    def __len__(self):
-        return len(self.df)
+    def _recompute_active_indices(self, force: bool = False) -> bool:
+        if not self.enable_curriculum:
+            new_indices = list(range(len(self.df)))
+        else:
+            mask = self.df["length"] <= self.current_length_limit
+            new_indices = self.df.index[mask].tolist()
+            if not new_indices:
+                raise ValueError(
+                    f"No samples available for max length {self.current_length_limit}. Check length_schedule."
+                )
 
-    def __getitem__(self, idx):
-        en_text = self.df.iloc[idx]["EN"].strip()
-        es_text = self.df.iloc[idx]["ES"].strip()
+        changed = force or new_indices != getattr(self, "active_indices", [])
+        if changed:
+            self.active_indices = new_indices
+        return changed
+
+    def set_length_limit(self, new_limit: int) -> bool:
+        capped_limit = min(new_limit, self.absolute_max_length)
+        if not self.enable_curriculum or capped_limit == self.current_length_limit:
+            self.current_length_limit = capped_limit
+            return False
+        self.current_length_limit = capped_limit
+        return self._recompute_active_indices()
+
+    def __len__(self) -> int:
+        return len(self.active_indices)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row_idx = self.active_indices[idx]
+        row = self.df.iloc[row_idx]
+        en_text = row["EN"].strip()
+        es_text = row["ES"].strip() + " <|END|>"
         prompt = self.template.format(en_text)
-        # full_text = template.format(english_text=en_text, spanish_text=es_text)
-        
-        es_text = es_text + " <|END|>"
-        # Tokenize prompt and full text
-        prompt_ids = self.tokenizer(prompt, truncation=True, max_length=self.max_length, add_special_tokens=False)["input_ids"]
-        es_ids = self.tokenizer(es_text, truncation=True, max_length=self.max_length, add_special_tokens=False)["input_ids"]
 
-        # Labels: -100 for prompt, actual tokens for output
-        labels = [-100] * len(prompt_ids) + es_ids
+        max_tokens = min(self.current_length_limit, self.absolute_max_length)
+        prompt_ids = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=max_tokens,
+            add_special_tokens=False,
+        )["input_ids"]
+
+        remaining_tokens = max_tokens - len(prompt_ids)
+        if remaining_tokens > 0:
+            es_ids = self.tokenizer(
+                es_text,
+                truncation=True,
+                max_length=remaining_tokens,
+                add_special_tokens=False,
+            )["input_ids"]
+        else:
+            es_ids = []
+
         input_ids = prompt_ids + es_ids
-
-        if len(input_ids) > self.max_length:
-            input_ids = input_ids[:self.max_length]
-            labels = labels[:self.max_length]
+        labels = [-100] * len(prompt_ids) + es_ids
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
+            "labels": torch.tensor(labels, dtype=torch.long),
         }
 
 
@@ -264,65 +334,63 @@ def dynamic_padding_collator(tokenizer: AutoTokenizer):
 
     return _collate
 
-train_dataset = TranslationDataset(train_df, tokenizer, max_length=max_length)
-val_dataset = TranslationDataset(val_df, tokenizer, max_length=max_length)
+
+def get_max_length_for_epoch(epoch: int, schedule: List[Tuple[int, int]]) -> int:
+    target = schedule[0][1]
+    for start_epoch, max_len in schedule:
+        if epoch >= start_epoch:
+            target = max_len
+        else:
+            break
+    return target
+
+
+class CurriculumSchedulerCallback(TrainerCallback):
+    def __init__(self, dataset: TranslationDataset, schedule: List[Tuple[int, int]]):
+        self.dataset = dataset
+        self.schedule = sorted(schedule, key=lambda item: item[0])
+        self.current_length = None
+
+    def _apply_schedule(self, epoch: int, control) -> None:
+        target_length = get_max_length_for_epoch(epoch, self.schedule)
+        if target_length == self.current_length:
+            return
+        length_changed = self.dataset.set_length_limit(target_length)
+        if not length_changed:
+            self.current_length = target_length
+            return
+        self.current_length = target_length
+        if control is not None:
+            control.should_recompute_train_dataloader = True
+        print(f"[Curriculum] Epoch {epoch}: max length set to {target_length}")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._apply_schedule(epoch=0, control=control)
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        epoch_number = int(state.epoch) if state.epoch is not None else 0
+        self._apply_schedule(epoch=epoch_number, control=control)
+
+initial_curriculum_length = get_max_length_for_epoch(0, length_schedule)
+train_dataset = TranslationDataset(
+    train_df,
+    tokenizer,
+    max_length=max_length,
+    initial_length_limit=initial_curriculum_length,
+    enable_curriculum=True,
+)
+val_dataset = TranslationDataset(
+    val_df,
+    tokenizer,
+    max_length=max_length,
+    initial_length_limit=max_length,
+    enable_curriculum=False,
+)
 data_collator = dynamic_padding_collator(tokenizer)
 
 
-preview_samples = []
-if len(val_df) > 0:
-    preview_samples = [
-        {"EN": row["EN"].strip(), "ES": row["ES"].strip()}
-        for _, row in val_df.sample(n=min(3, len(val_df)), random_state=123).iterrows()
-    ]
-
-
-class SampleTranslationCallback(TrainerCallback):
-    """Logs a few reference/prediction pairs after each epoch."""
-
-    def __init__(self, tokenizer, samples, max_new_tokens=80):
-        self.tokenizer = tokenizer
-        self.samples = samples
-        self.max_new_tokens = max_new_tokens
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if not self.samples:
-            return
-
-        model = kwargs.get("model")
-        if model is None:
-            return
-
-        device = next(model.parameters()).device
-        print(f"\n=== Sample translations after epoch {int(state.epoch or 0)} ===")
-        model.eval()
-
-        with torch.no_grad():
-            for idx, sample in enumerate(self.samples, start=1):
-                prompt = f"English: {sample['EN']} Spanish: "
-                encoded = self.tokenizer(prompt, return_tensors="pt")
-                encoded = {k: v.to(device) for k, v in encoded.items()}
-                generated = model.generate(
-                    **encoded,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-
-                input_len = encoded["input_ids"].shape[-1]
-                new_tokens = generated[0, input_len:]
-                pred_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-                pred_text = pred_text.split("<|END|>")[0].strip()
-
-                print(f"Sample {idx}")
-                print(f"EN : {sample['EN']}")
-                print(f"ES*: {sample['ES']}")
-                print(f"ES^: {pred_text if pred_text else '<empty>'}\n")
-
-
-
 sample_idx = 0
-sample_row = train_df.iloc[sample_idx]
+sample_row = train_df.iloc[train_dataset.active_indices[sample_idx]]
 actual_text = template.format(english_text=sample_row['EN'], spanish_text=sample_row['ES'])
 print("Actual text:", actual_text)
 
@@ -360,7 +428,7 @@ training_args = TrainingArguments(
     greater_is_better=False,
     logging_dir=f"exp-data/runs/{run_name}/logs",
     logging_steps=1000,
-    report_to=[],
+    report_to=["wandb"],
     max_grad_norm=grad_clip_val,
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
@@ -380,8 +448,8 @@ trainer = Trainer(
     data_collator=data_collator,
 )
 
-if preview_samples:
-    trainer.add_callback(SampleTranslationCallback(tokenizer, preview_samples, max_new_tokens=80))
+curriculum_callback = CurriculumSchedulerCallback(train_dataset, length_schedule)
+trainer.add_callback(curriculum_callback)
 
 trainer.add_callback(
     EarlyStoppingCallback(
@@ -392,16 +460,15 @@ trainer.add_callback(
 trainer.remove_callback(PrinterCallback)
 
 trainer.train()
+best_model_path = trainer.state.best_model_checkpoint
+print("Best model saved at:", best_model_path)
 
-# best_model_path = trainer.state.best_model_checkpoint
-# print("Best model saved at:", best_model_path)
-
-# best_checkpoint = trainer.state.best_model_checkpoint
-# if best_checkpoint is not None:
-#     print(f"Loading best model from {best_checkpoint}")
-#     trainer._load_best_model()
-# else:
-#     print("No best checkpoint found; evaluating current model weights.")
+best_checkpoint = trainer.state.best_model_checkpoint
+if best_checkpoint is not None:
+    print(f"Loading best model from {best_checkpoint}")
+    trainer._load_best_model()
+else:
+    print("No best checkpoint found; evaluating current model weights.")
 eval_results = trainer.evaluate(eval_dataset=val_dataset)
 val_loss = eval_results.get("eval_loss")
 print(f"Validation loss: {val_loss}")
@@ -413,9 +480,6 @@ hf_token = os.environ.get("HF_TOKEN")
 
 artifact_dir = Path("exp-data/hf-artifacts") / Path(run_name).name
 artifact_dir.mkdir(parents=True, exist_ok=True)
-
-model = trainer.model
-tokenizer = trainer.tokenizer
 
 model.save_pretrained(artifact_dir)
 tokenizer.save_pretrained(artifact_dir)

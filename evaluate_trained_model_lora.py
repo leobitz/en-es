@@ -17,8 +17,11 @@ import argparse
 import requests
 import subprocess
 import time
-
+from dotenv import load_dotenv
+load_dotenv()
 set_seed(42)
+token = os.getenv("HF_TOKEN")
+
 
 parser = argparse.ArgumentParser(description="Evaluate translation model.")
 parser.add_argument(
@@ -26,56 +29,39 @@ parser.add_argument(
     default="HuggingFaceTB/SmolLM-135M",
     help="Hugging Face model identifier to evaluate.",
 )
+# take temprature as argument
+parser.add_argument(
+    "--temperature",
+    type=float,
+    default=0.2,
+    help="Temperature for sampling during generation.",
+)
+# top_p argument
+parser.add_argument(
+    "--top_p",
+    type=float,
+    default=0.8,
+    help="Top-p (nucleus) sampling parameter during generation.",
+)
+
 model_name = parser.parse_args().model_name
+temperature = parser.parse_args().temperature
+top_p = parser.parse_args().top_p
+print(model_name)
 
-server_cmd = [
-    "vllm",
-    "serve",
-    model_name,
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "8000",
-    "--max-model-len",
-    "2048",
-    "--gpu-memory-utilization",
-    "0.9",
-]
-
-
-def start_vllm_server(cmd):
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-
-def wait_for_vllm_ready(status_url="http://localhost:8000/v1/models", timeout=300, interval=5):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            response = requests.get(status_url, timeout=5)
-            if response.ok:
-                return
-        except requests.RequestException:
-            pass
-        time.sleep(interval)
-    raise TimeoutError(f"vLLM server did not become ready within {timeout} seconds.")
-
-
-def stop_vllm_server(process, timeout=15):
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-
-
+num_layers = 0
+num_task_layers = 0
+num_frozen_layers = 0
+# leobitz/lora-qlora-frozen-18-task-layers-0-aug-0.2
+if "frozen" in model_name and "task-layers" in model_name:
+    num_task_layers = int(model_name.split("task-layers-")[1].split("-")[0])
+    num_frozen_layers = int(model_name.split("frozen-")[1].split("-task-layers-")[0])
+    num_layers = num_task_layers + num_frozen_layers
 
 df = pd.read_parquet("exp-data/en-es.parquet")
 batch_size = 16
 
-
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
 
 
 tokenizer_args = {
@@ -169,70 +155,39 @@ def few_shot_prompting(text):
 def euro_llm_prompting(text):
     return f"English: {text} Spanish: "
 
-
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="dummy"
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoConfig
 )
-async_client = AsyncOpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="dummy"
-)
+from transformers import LlamaForCausalLM
 
-async def proc_prompt_async(prompt):
-    response = await async_client.completions.create(
-        model=model_name,
-        prompt=prompt,
-        max_tokens=512,
-        temperature=0.0,
-        stop=["[END]"],
-        top_p=1.0,
-    )
-    return response.choices[0].text.strip()
+print("Loading model...")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+new_config = AutoConfig.from_pretrained(model_name, token=token)
+if num_frozen_layers > 0:
+    new_config.num_hidden_layers = num_task_layers + num_frozen_layers
+model = LlamaForCausalLM.from_pretrained(model_name, config=new_config, token=token).to(device)
+print(len(model.model.layers))
+tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+print("Model loaded.")
+def proc_prompt(prompt):
+    return model.generate(prompt, temperature=temperature, top_p=top_p, max_new_tokens=512, stop="<|END|>")[0]['generated_text']
 
-
-async def proc_batch_async(texts, max_concurrency=8, prompt_fn=few_shot_prompting):
+def proc_batch(texts, prompt_fn=euro_llm_prompting):
     prompts = [prompt_fn(t) for t in texts]
-    semaphore = asyncio.Semaphore(max_concurrency)
+    return [proc_prompt(p) for p in prompts]
+print("Starting evaluation...")
+result = evaluate(
+    test_df,
+    text_col='EN',
+    ref_col='ES',
+    translator=proc_batch,
+    save_col='translation',
+)
 
-    async def bounded_call(prompt):
-        async with semaphore:
-            return await proc_prompt_async(prompt)
+eval_dir_name = "eval-results"
+os.makedirs(eval_dir_name, exist_ok=True)
 
-    tasks = [bounded_call(p) for p in prompts]
-    return await asyncio.gather(*tasks)
-
-_bg_loop = asyncio.new_event_loop()
-_bg_thread = threading.Thread(target=_bg_loop.run_forever, daemon=True)
-_bg_thread.start()
-
-def _shutdown_loop():
-    _bg_loop.call_soon_threadsafe(_bg_loop.stop)
-    _bg_thread.join()
-
-atexit.register(_shutdown_loop)
-
-def proc_batch(texts):
-    future = asyncio.run_coroutine_threadsafe(proc_batch_async(texts, prompt_fn=euro_llm_prompting), _bg_loop)
-    return future.result()
-
-server_process = start_vllm_server(server_cmd)
-
-try:
-    wait_for_vllm_ready()
-    result = evaluate(
-        test_df,
-        text_col='EN',
-        ref_col='ES',
-        translator=proc_batch,
-        save_col='translation',
-    )
-
-    eval_dir_name = "eval-results"
-
-    os.makedirs(eval_dir_name, exist_ok=True)
-
-    with open(os.path.join(eval_dir_name, f"{model_name.replace('/', '_')}_evaluation.json"), "w") as f:
-        json.dump(result, f, indent=4)
-finally:
-    stop_vllm_server(server_process)
+with open(os.path.join(eval_dir_name, f"{model_name.replace('/', '_')}_evaluation.json"), "w") as f:
+    json.dump(result, f, indent=4)
