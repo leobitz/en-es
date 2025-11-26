@@ -11,6 +11,7 @@ from pathlib import Path
 from huggingface_hub import HfApi, create_repo
 import pandas as pd
 from datasets import Dataset
+from typing import Any, Dict, List, Optional
 
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig
@@ -99,6 +100,15 @@ WEIGHT_DECAY = args.weight_decay
 GRAD_CLIP_VAL = 1.0
 DATALOADER_WORKERS = mp.cpu_count() - 1 if mp.cpu_count() > 1 else 1
 
+CURRICULUM_STAGES = [
+    {"label": 0, "max_length": 64},
+    {"label": 2, "max_length": 128},
+    {"label": 4, "max_length": 256},
+    {"label": 5, "max_length": 384},
+    {"label": 7, "max_length": 480},
+    {"label": 10, "max_length": None},  # None represents no upper bound (max)
+]
+
 new_config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
 new_config.num_hidden_layers = num_frozen_layers + num_task_layers
 
@@ -142,7 +152,6 @@ else:
         trust_remote_code=True,
         config=new_config,
     )
-
     # Freeze all layers except the last `num_task_layer` in model.model.layers
     for name, param in model.named_parameters():
         param.requires_grad = False
@@ -200,8 +209,18 @@ if aug_size > 0:
 train_df = train_df.drop_duplicates(subset=["EN", "ES"]).reset_index(drop=True)
 val_df = val_df.drop_duplicates(subset=["EN", "ES"]).reset_index(drop=True)
 
-train_dataset = Dataset.from_pandas(train_df)
-val_dataset   = Dataset.from_pandas(val_df)
+if "length" not in train_df.columns or "length" not in val_df.columns:
+    raise ValueError("Both train and validation dataframes must contain a 'length' column for curriculum learning.")
+
+def filter_by_length_range(
+    df: pd.DataFrame, min_length: Optional[float], max_length: Optional[float]
+) -> pd.DataFrame:
+    mask = pd.Series(True, index=df.index)
+    if min_length is not None:
+        mask &= df["length"] > min_length
+    if max_length is not None:
+        mask &= df["length"] <= max_length
+    return df[mask].reset_index(drop=True)
 
 # Instruction template for translation
 INSTRUCTION = "English: {en} Spanish:"
@@ -210,128 +229,198 @@ def formatting_prompts_func(example):
     text = INSTRUCTION.format(en=example["EN"]) + " " + example["ES"] + tokenizer.eos_token
     return {"text": text}
 
-train_dataset = train_dataset.map(formatting_prompts_func)
-val_dataset   = val_dataset.map(formatting_prompts_func)
-
-# Tokenize
 def tokenize_function(examples):
     return tokenizer(
         examples["text"],
         truncation=True,
         max_length=MAX_SEQ_LENGTH,
-        padding=False,  # Will be handled by DataCollatorForLanguageModeling
+        padding=False,
     )
 
-example_samples = val_dataset.select(range(3))
+def build_sft_dataset(df: pd.DataFrame) -> Optional[Dataset]:
+    if df.empty:
+        return None
+    dataset = Dataset.from_pandas(df, preserve_index=False)
+    dataset = dataset.map(formatting_prompts_func, remove_columns=dataset.column_names)
+    dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    return dataset
 
-train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=train_dataset.column_names)
-val_dataset   = val_dataset.map(tokenize_function, batched=True, remove_columns=val_dataset.column_names)
+def sample_examples(
+    df: pd.DataFrame, fallback_df: pd.DataFrame, num_samples: int = 3
+) -> List[Dict[str, Any]]:
+    source_df = df if not df.empty else fallback_df
+    if source_df.empty:
+        return []
+    sample_size = min(num_samples, len(source_df))
+    return source_df.sample(n=sample_size, random_state=42).to_dict(orient="records")
 
 
 class TranslationEvalCallback(TrainerCallback):
-    def __init__(self, tokenizer, val_dataset, num_samples=3):
+    def __init__(
+        self,
+        tokenizer,
+        samples: List[Dict[str, Any]],
+        instruction_template: str,
+        stage_name: str,
+        max_new_tokens: int = 128,
+    ):
         self.tokenizer = tokenizer
-        self.val_dataset = val_dataset.select(range(min(num_samples * 10, len(val_dataset))))  # small pool
-        self.num_samples = num_samples
+        self.samples = samples
+        self.instruction_template = instruction_template
+        self.stage_name = stage_name
+        self.max_new_tokens = max_new_tokens
 
-    def generate_translation(self, model, prompt):
+    def generate_translation(self, model, prompt: str) -> str:
+        if self.tokenizer.pad_token is None and self.tokenizer.pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        else:
+            pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+
         inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=self.max_new_tokens,
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
-                pad_token_id=self.tokenizer.eos_token_id,
-
+                pad_token_id=pad_token_id,
             )
         full_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
-        # Extract only the Spanish part after "Spanish:"
-        try:
-            spanish = full_text.split("Spanish:")[1].strip().split(tokenizer.eos_token)[0].strip()
-        except:
-            spanish = full_text.split("Spanish:")[1].strip() if "Spanish:" in full_text else "ERROR"
-        return spanish
+        if "Spanish:" in full_text:
+            spanish = full_text.split("Spanish:", 1)[1].strip()
+            eos_token = self.tokenizer.eos_token or ""
+            if eos_token and eos_token in spanish:
+                spanish = spanish.split(eos_token, 1)[0].strip()
+        else:
+            spanish = full_text
+        return spanish.strip()
 
     def on_epoch_end(self, args, state, control, **kwargs):
+        if not self.samples:
+            return control
+
         model = kwargs["model"]
+        was_training = model.training
         model.eval()
 
-        print("\n" + "="*80)
-        print(f"END OF EPOCH {state.epoch:.1f} - SAMPLE TRANSLATIONS")
-        print("="*80)
+        print("\n" + "=" * 80)
+        epoch_display = f"{state.epoch:.1f}" if state.epoch is not None else "?"
+        print(f"END OF EPOCH {epoch_display} - {self.stage_name} SAMPLE TRANSLATIONS")
+        print("=" * 80)
 
-
-        for i, sample in enumerate(example_samples, 1):
-            prompt = INSTRUCTION.format(en=sample["EN"])
-
-            # base_pred = self.generate_translation(self.base_model, prompt)
+        for i, sample in enumerate(self.samples, 1):
+            prompt = self.instruction_template.format(en=sample["EN"])
             current_pred = self.generate_translation(model, prompt)
             reference = sample["ES"]
 
-            # print(f"\nSample {i}:")
             print(f"EN → {sample['EN']}")
             print(f"REF → {reference}")
-            # print(f"BASE (SmolLM2-135M) → {base_pred}")
             print(f"CURRENT (Fine-tuned) → {current_pred}")
-            print("-"*80)
+            print("-" * 80)
 
-        model.train()
+        if was_training:
+            model.train()
 
-# ==========================
-# Training arguments
-# ==========================
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-    learning_rate=LEARNING_RATE,
-    num_train_epochs=NUM_EPOCHS,
-    logging_steps=1000,
-    save_strategy="epoch",
-    eval_strategy="epoch",
-    fp16=False,
-    bf16=True,
-    report_to=["wandb"],
-    warmup_ratio=0.1,
-    lr_scheduler_type="cosine",
-    optim="paged_adamw_8bit",
-    remove_unused_columns=False,
-    run_name=RUN_NAME,
-    weight_decay=WEIGHT_DECAY,
-    save_total_limit=0,
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
-    logging_dir=f"exp-data/runs/{RUN_NAME}/logs",
-    max_grad_norm=GRAD_CLIP_VAL,
-    dataloader_num_workers=DATALOADER_WORKERS,
-    logging_strategy="steps",
-    disable_tqdm=False,  
-)
+def build_stage_training_args(stage_name: str, stage_output_dir: str) -> TrainingArguments:
+    return TrainingArguments(
+        output_dir=stage_output_dir,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
+        num_train_epochs=NUM_EPOCHS,
+        logging_steps=1000,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        fp16=False,
+        bf16=bf16,
+        report_to=[],
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+        optim="paged_adamw_8bit" if lora else "adamw_torch",
+        remove_unused_columns=False,
+        run_name=stage_name,
+        weight_decay=WEIGHT_DECAY,
+        save_total_limit=0,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        logging_dir=f"exp-data/runs/{RUN_NAME}/logs/{stage_name}",
+        max_grad_norm=GRAD_CLIP_VAL,
+        dataloader_num_workers=DATALOADER_WORKERS,
+        logging_strategy="steps",
+        disable_tqdm=False,
+    )
 
-# ==========================
-# SFTTrainer
-# ==========================
-trainer = SFTTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    peft_config=peft_config,
-    callbacks=[TranslationEvalCallback(tokenizer, val_dataset, num_samples=3)],
-)
+final_trainer = None
+current_model = model
+previous_max_length = None
 
-# ==========================
-# Start training
-# ==========================
-print("Starting fine-tuning for English → Spanish translation with LoRA...")
-trainer.train()
+print("Starting fine-tuning for English → Spanish translation with curriculum learning...")
+
+for stage_idx, stage in enumerate(CURRICULUM_STAGES):
+    stage_min_length = previous_max_length
+    stage_max_length = stage["max_length"]
+    previous_max_length = stage_max_length
+
+    stage_train_df = filter_by_length_range(train_df, stage_min_length, stage_max_length)
+    stage_val_df = filter_by_length_range(val_df, stage_min_length, stage_max_length)
+
+    if stage_train_df.empty:
+        continue
+
+    stage_label = stage["label"]
+    stage_suffix = stage_max_length if stage_max_length is not None else "max"
+    stage_name = f"{RUN_NAME}-stage{stage_label}-len{stage_suffix}"
+    stage_output_dir = os.path.join(OUTPUT_DIR, f"stage-{stage_label}-len-{stage_suffix}")
+
+    print(
+        f"\nStarting curriculum stage {stage_label} (length <= {stage_suffix}) with {len(stage_train_df)} training samples"
+    )
+
+    stage_train_dataset = build_sft_dataset(stage_train_df)
+    stage_val_dataset = build_sft_dataset(stage_val_df) if not stage_val_df.empty else None
+
+    stage_examples = sample_examples(stage_val_df, stage_train_df)
+    callbacks = []
+    if stage_examples:
+        callbacks.append(
+            TranslationEvalCallback(
+                tokenizer=tokenizer,
+                samples=stage_examples,
+                instruction_template=INSTRUCTION,
+                stage_name=f"Stage {stage_label}",
+            )
+        )
+
+    stage_training_args = build_stage_training_args(stage_name, stage_output_dir)
+    stage_peft_config = peft_config if (peft_config is not None and final_trainer is None) else None
+
+    trainer = SFTTrainer(
+        model=current_model,
+        args=stage_training_args,
+        train_dataset=stage_train_dataset,
+        eval_dataset=stage_val_dataset,
+        peft_config=stage_peft_config,
+        callbacks=callbacks if callbacks else None,
+    )
+
+    trainer.train()
+    current_model = trainer.model
+    final_trainer = trainer
+
+if final_trainer is None:
+    raise RuntimeError("No curriculum stage contained training data. Check the length thresholds and dataset.")
+
+print("\nCurriculum training complete. Evaluating on the full validation set...")
+
+full_val_dataset = build_sft_dataset(val_df)
+eval_results = final_trainer.evaluate(eval_dataset=full_val_dataset)
+val_loss = eval_results.get("eval_loss", float("nan"))
 
 # Save final LoRA adapter
-trainer.save_model(OUTPUT_DIR)
+final_trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
 
 
@@ -359,8 +448,6 @@ if lora:
     print(f"Merged full model saved to {MERGED_OUTPUT_DIR}")
 else:
     MERGED_OUTPUT_DIR = OUTPUT_DIR
-
-val_loss = trainer.evaluate()['eval_loss']
 
 hf_repo_id = OUTPUT_DIR.split("/")[-1]
 hf_repo_id = f"leobitz/{hf_repo_id}-merged"
