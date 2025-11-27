@@ -1,0 +1,26 @@
+{
+    "wmt24": {
+        "sacrebleu": 2.9664808001937084,
+        "chrf": 19.393998305527166
+    },
+    "corpus-en-es": {
+        "sacrebleu": 8.58867023564234,
+        "chrf": 33.90180350326265
+    },
+    "scientific_papers_en_es": {
+        "sacrebleu": 2.7374570989348927e-69,
+        "chrf": 0.5956639883731564
+    },
+    "Document-Translation-en-es": {
+        "sacrebleu": 1.3453721787995832,
+        "chrf": 16.94400484162717
+    },
+    "medical-translation-test-set": {
+        "sacrebleu": 2.853718320323717,
+        "chrf": 24.752557375719263
+    },
+    "all": {
+        "sacrebleu": 4.141801475499361e-05,
+        "chrf": 4.344918822754914
+    }
+}

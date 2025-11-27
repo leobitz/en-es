@@ -155,31 +155,38 @@ ds = load_dataset("google/wmt24pp", "en-es_MX")
 
 datasets_names=[
                 'wmt24', 
-                # 'corpus-en-es', 'scientific_papers_en_es', 'Document-Translation-en-es', 'medical-translation-test-set'
+                'corpus-en-es', 
+                'scientific_papers_en_es', 
+                'Document-Translation-en-es', 
+                'medical-translation-test-set'
                 ]
 test_df = df[df['dataset'].isin(datasets_names)].reset_index(drop=True)
 
-
 max_per_dataset = 1000
-all_test_df = test_df[test_df['split'] == 'test'].reset_index(drop=True)
-all_test_df['tokenizer-len'] = all_test_df['EN'].apply(lambda x: len(tokenizer(x)['input_ids']))
+if not os.path.exists("exp-data/en-es-eval.parquet"):
+    
+    all_test_df = test_df[test_df['split'] == 'test'].reset_index(drop=True)
+    all_test_df['tokenizer-len'] = all_test_df['EN'].apply(lambda x: len(tokenizer(x)['input_ids']))
 
-df = df.rename(columns={"source": "EN", "target": "ES"})
-df['dataset'] = 'wmt24'
-df['length'] = df['EN'].apply(lambda x: len(tokenizer(x)['input_ids']))
-wmt_df = df[['dataset', 'EN', 'ES', 'length']]
-all_test_df = pd.concat([all_test_df, wmt_df]).reset_index(drop=True)
+    df = df.rename(columns={"source": "EN", "target": "ES"})
+    df['dataset'] = 'wmt24'
+    df['tokenizer-len'] = df['EN'].apply(lambda x: len(tokenizer(x)['input_ids']))
+    wmt_df = df[['dataset', 'EN', 'ES', 'tokenizer-len']]
+    all_test_df = pd.concat([all_test_df, wmt_df]).reset_index(drop=True)
 
-# # length less than 1024 tokens
-all_test_df = all_test_df[all_test_df['tokenizer-len'] < 512].reset_index(drop=True)
-test_dfs = []
-for name in datasets_names:
-    sub_df = all_test_df[all_test_df['dataset'] == name].reset_index(drop=True)
-    print(f"{name}: {len(sub_df)} samples")
-    if len(sub_df) > max_per_dataset:
-        sub_df = sub_df.sample(n=max_per_dataset, random_state=42).reset_index(drop=True)
-    test_dfs.append(sub_df)
-test_df = pd.concat(test_dfs).reset_index(drop=True)
+    # # length less than 1024 tokens
+    all_test_df = all_test_df[all_test_df['tokenizer-len'] < 512].reset_index(drop=True)
+    test_dfs = []
+    for name in datasets_names:
+        sub_df = all_test_df[all_test_df['dataset'] == name].reset_index(drop=True)
+        if len(sub_df) > max_per_dataset:
+            sub_df = sub_df.sample(n=max_per_dataset, random_state=42).reset_index(drop=True)
+        print(f"{name}: {len(sub_df)} samples")
+        test_dfs.append(sub_df)
+    test_df = pd.concat(test_dfs).reset_index(drop=True)
+    test_df.to_parquet("exp-data/en-es-eval.parquet", index=False)
+else:
+    test_df = pd.read_parquet("exp-data/en-es-eval.parquet")
 
 def plain_prompting(text):
     return f"""
@@ -216,10 +223,10 @@ async_client = AsyncOpenAI(
 async def proc_prompt_async(prompt):
     response = await async_client.completions.create(
         model=model_name,
-        prompt=prompt,
+        prompt=prompt.replace("\n", " ").strip(),
         max_tokens=512,
         temperature=temperature,
-        stop=["<|END|>"],
+        stop=["\n"],
         top_p=top_p,
     )
     return response.choices[0].text.strip()
@@ -291,7 +298,7 @@ try:
 
     os.makedirs(eval_dir_name, exist_ok=True)
 
-    with open(os.path.join(eval_dir_name, f"{model_name.replace('/', '_')}_evaluation.json"), "w") as f:
+    with open(os.path.join(eval_dir_name, f"{model_name.replace('/', '_')}_T{temperature}_P{top_p}_evaluation.json"), "w") as f:
         json.dump(result, f, indent=4)
 finally:
     stop_vllm_server(server_process)

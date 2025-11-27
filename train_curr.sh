@@ -1,6 +1,5 @@
 python sft_train_curriculum.py --num_frozen_layers 30 --num_task_layers 0 --aug_size 0.0 --epochs 10 --bf16 --lora
-python sft_train_curriculum.py --num_frozen_layers 28 --num_task_layers 2 --aug_size 0.0 --epochs 10 --bf16 --lora
-python sft_train.py --num_frozen_layers 30 --num_task_layers 0 --aug_size 1.0 --epochs 10 --no-bf16
+python sft_train_curriculum.py --num_frozen_layers 28 --num_task_layers 2 --aug_size 0.0 --epochs 10 --no-bf16
 
 # python sft_train.py --num_frozen_layers 22 --num_task_layers 2 --aug_size 1.0 --epochs 10
 # python sft_train.py --num_frozen_layers 14 --num_task_layers 2 --aug_size 1.0 --epochs 10

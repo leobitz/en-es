@@ -335,7 +335,7 @@ def build_stage_training_args(stage_name: str, stage_output_dir: str) -> Trainin
         eval_strategy="epoch",
         fp16=False,
         bf16=bf16,
-        report_to=[],
+        report_to=["wandb"],
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         optim="paged_adamw_8bit" if lora else "adamw_torch",
